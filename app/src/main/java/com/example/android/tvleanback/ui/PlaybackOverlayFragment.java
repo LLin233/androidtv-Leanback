@@ -18,6 +18,7 @@ package com.example.android.tvleanback.ui;
 
 import android.app.Activity;
 import android.app.LoaderManager;
+import android.app.PendingIntent;
 import android.content.Context;
 import android.content.CursorLoader;
 import android.content.Intent;
@@ -26,6 +27,7 @@ import android.content.res.Resources;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.SurfaceTexture;
+import android.media.AudioManager;
 import android.media.MediaDescription;
 import android.media.MediaMetadata;
 import android.media.session.MediaController;
@@ -42,7 +44,6 @@ import android.support.v17.leanback.widget.ImageCardView;
 import android.support.v17.leanback.widget.ListRow;
 import android.support.v17.leanback.widget.ListRowPresenter;
 import android.support.v17.leanback.widget.OnItemViewClickedListener;
-import android.support.v17.leanback.widget.OnItemViewSelectedListener;
 import android.support.v17.leanback.widget.PlaybackControlsRow;
 import android.support.v17.leanback.widget.PlaybackControlsRowPresenter;
 import android.support.v17.leanback.widget.Presenter;
@@ -56,7 +57,6 @@ import android.view.TextureView;
 import com.bumptech.glide.Glide;
 import com.bumptech.glide.request.animation.GlideAnimation;
 import com.bumptech.glide.request.target.SimpleTarget;
-import com.example.android.tvleanback.BuildConfig;
 import com.example.android.tvleanback.R;
 import com.example.android.tvleanback.Utils;
 import com.example.android.tvleanback.data.VideoContract;
@@ -85,7 +85,6 @@ public class PlaybackOverlayFragment
         implements LoaderManager.LoaderCallbacks<Cursor>, TextureView.SurfaceTextureListener,
         VideoPlayer.Listener {
     private static final String TAG = "PlaybackOverlayFragment";
-    private static final boolean DEBUG = BuildConfig.DEBUG;
     private static final int BACKGROUND_TYPE = PlaybackOverlayFragment.BG_LIGHT;
     private static final String AUTO_PLAY = "auto_play";
     private static final Bundle mAutoPlayExtras = new Bundle();
@@ -97,19 +96,51 @@ public class PlaybackOverlayFragment
     }
 
     private final VideoCursorMapper mVideoCursorMapper = new VideoCursorMapper();
-    private final MediaController.Callback mMediaControllerCallback = new MediaControllerCallback();
     private int mSpecificVideoLoaderId = 3;
     private int mQueueIndex = -1;
     private Video mSelectedVideo; // Video is the currently playing Video and its metadata.
     private ArrayObjectAdapter mRowsAdapter;
-    private List<MediaSession.QueueItem> mQueue;
+    private List<MediaSession.QueueItem> mQueue = new ArrayList<>();
     private CursorObjectAdapter mVideoCursorAdapter;
     private MediaSession mSession; // MediaSession is used to hold the state of our media playback.
     private LoaderManager.LoaderCallbacks<Cursor> mCallbacks;
     private MediaController mMediaController;
     private PlaybackControlHelper mGlue;
+    private MediaController.Callback mMediaControllerCallback;
     private VideoPlayer mPlayer;
     private boolean mIsMetadataSet = false;
+    private AudioManager mAudioManager;
+    private boolean mHasAudioFocus;
+    private boolean mPauseTransient;
+    private final AudioManager.OnAudioFocusChangeListener mOnAudioFocusChangeListener =
+            new AudioManager.OnAudioFocusChangeListener() {
+                @Override
+                public void onAudioFocusChange(int focusChange) {
+                    switch (focusChange) {
+                        case AudioManager.AUDIOFOCUS_LOSS:
+                            abandonAudioFocus();
+                            pause();
+                            break;
+                        case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
+                            if (mGlue.isMediaPlaying()) {
+                                pause();
+                                mPauseTransient = true;
+                            }
+                            break;
+                        case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
+                            mPlayer.mute(true);
+                            break;
+                        case AudioManager.AUDIOFOCUS_GAIN:
+                        case AudioManager.AUDIOFOCUS_GAIN_TRANSIENT:
+                        case AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK:
+                            if (mPauseTransient) {
+                                play();
+                            }
+                            mPlayer.mute(false);
+                            break;
+                    }
+                }
+            };
 
     @Override
     public void onAttach(Context context) {
@@ -117,14 +148,12 @@ public class PlaybackOverlayFragment
         mCallbacks = this;
 
         createMediaSession();
-
-        mMediaController = getActivity().getMediaController();
-        mMediaController.registerCallback(mMediaControllerCallback);
     }
 
     @Override
     public void onStop() {
         super.onStop();
+
         mSession.release();
         releasePlayer();
     }
@@ -133,44 +162,30 @@ public class PlaybackOverlayFragment
     public void onDestroy() {
         super.onDestroy();
 
+        if (mMediaController != null) {
+            mMediaController.unregisterCallback(mMediaControllerCallback);
+        }
         mSession.release();
         releasePlayer();
     }
 
     @Override
-    public void onDetach() {
-        super.onDetach();
-        if (mMediaController != null) {
-            mMediaController.unregisterCallback(mMediaControllerCallback);
+    public void onStart() {
+        super.onStart();
+
+        // Set up UI
+        Video video = getActivity().getIntent().getParcelableExtra(VideoDetailsActivity.VIDEO);
+        if (!updateSelectedVideo(video)) {
+            return;
         }
-    }
-
-    @Override
-    public void onResume() {
-        super.onResume();
-
-        if (mPlayer == null) {
-            preparePlayer(true);
-        }
-    }
-
-    @Override
-    public void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-
-        // Initialize instance variables.
-        TextureView textureView = (TextureView) getActivity().findViewById(R.id.texture_view);
-        textureView.setSurfaceTextureListener(this);
-
-        mSelectedVideo = getActivity().getIntent().getParcelableExtra(VideoDetailsActivity.VIDEO);
-        mQueue = new ArrayList<>();
-
-        // Set up UI.
-        setBackgroundType(BACKGROUND_TYPE);
 
         mGlue = new PlaybackControlHelper(getContext(), this, mSelectedVideo);
         PlaybackControlsRowPresenter controlsRowPresenter = mGlue.createControlsRowAndPresenter();
         PlaybackControlsRow controlsRow = mGlue.getControlsRow();
+        mMediaControllerCallback = mGlue.createMediaControllerCallback();
+
+        mMediaController = getActivity().getMediaController();
+        mMediaController.registerCallback(mMediaControllerCallback);
 
         ClassPresenterSelector ps = new ClassPresenterSelector();
         ps.addClassPresenter(PlaybackControlsRow.class, controlsRowPresenter);
@@ -181,34 +196,74 @@ public class PlaybackOverlayFragment
         updatePlaybackRow();
         setAdapter(mRowsAdapter);
 
-        // Prepare the player and start playing the selected video.
-        playVideo(mSelectedVideo, mAutoPlayExtras);
+        startPlaying();
+    }
 
-        // Start loading videos for the queue.
-        Bundle args = new Bundle();
-        args.putString(VideoContract.VideoEntry.COLUMN_CATEGORY, mSelectedVideo.category);
-        getLoaderManager().initLoader(QUEUE_VIDEOS_LOADER, args, mCallbacks);
+    @Override
+    public void onResume() {
+        super.onResume();
+        Video video = getActivity().getIntent().getParcelableExtra(VideoDetailsActivity.VIDEO);
+        if (!updateSelectedVideo(video)) {
+            return;
+        }
 
-        // Set up listeners.
-        setOnItemViewSelectedListener(new OnItemViewSelectedListener() {
-            @Override
-            public void onItemSelected(Presenter.ViewHolder itemViewHolder, Object item,
-                    RowPresenter.ViewHolder rowViewHolder, Row row) {
-            }
-        });
+        startPlaying();
+    }
+
+    @Override
+    public void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        mAudioManager = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+
+        // Initialize instance variables.
+        TextureView textureView = (TextureView) getActivity().findViewById(R.id.texture_view);
+        textureView.setSurfaceTextureListener(this);
+
+        setBackgroundType(BACKGROUND_TYPE);
+
+        // Set up listener.
         setOnItemViewClickedListener(new ItemViewClickedListener());
+    }
+
+    private boolean updateSelectedVideo(Video video) {
+        Intent intent = new Intent(getActivity().getIntent());
+        intent.putExtra(VideoDetailsActivity.VIDEO, video);
+        if (mSelectedVideo != null && mSelectedVideo.equals(video)) {
+            return false;
+        }
+        mSelectedVideo = video;
+
+        PendingIntent pi = PendingIntent.getActivity(
+                getActivity(), 0, intent, PendingIntent.FLAG_UPDATE_CURRENT);
+        mSession.setSessionActivity(pi);
+
+        return true;
     }
 
     @Override
     public void onPause() {
         super.onPause();
-        if (mPlayer.getPlayerControl().isPlaying()) {
+        if (mGlue.isMediaPlaying()) {
             boolean isVisibleBehind = getActivity().requestVisibleBehind(true);
-            if (!isVisibleBehind) {
-                playPause(false);
+            boolean isInPictureInPictureMode =
+                    PlaybackOverlayActivity.supportsPictureInPicture(getContext())
+                            && getActivity().isInPictureInPictureMode();
+            if (!isVisibleBehind && !isInPictureInPictureMode) {
+                pause();
             }
         } else {
             getActivity().requestVisibleBehind(false);
+        }
+    }
+
+    @Override
+    public void onPictureInPictureModeChanged(boolean pictureInPictureMode) {
+        if (pictureInPictureMode) {
+            mGlue.setFadingEnabled(false);
+            setFadingEnabled(true);
+            fadeOut();
+        } else {
+            mGlue.setFadingEnabled(true);
         }
     }
 
@@ -360,22 +415,53 @@ public class PlaybackOverlayFragment
         return actions;
     }
 
-    private void playPause(boolean doPlay) {
+    private void play() {
+        // Request audio focus whenever we resume playback
+        // because the app might have abandoned audio focus due to the AUDIOFOCUS_LOSS.
+        requestAudioFocus();
+
         if (mPlayer == null) {
             setPlaybackState(PlaybackState.STATE_NONE);
             return;
         }
-
-        if (doPlay && getPlaybackState() != PlaybackState.STATE_PLAYING) {
+        if (!mGlue.isMediaPlaying()) {
             mPlayer.getPlayerControl().start();
             setPlaybackState(PlaybackState.STATE_PLAYING);
-        } else {
+        }
+    }
+
+    private void pause() {
+        mPauseTransient = false;
+
+        if (mPlayer == null) {
+            setPlaybackState(PlaybackState.STATE_NONE);
+            return;
+        }
+        if (mGlue.isMediaPlaying()) {
             mPlayer.getPlayerControl().pause();
             setPlaybackState(PlaybackState.STATE_PAUSED);
         }
     }
 
-    private void updatePlaybackRow() {
+    private void requestAudioFocus() {
+        if (mHasAudioFocus) {
+            return;
+        }
+        int result = mAudioManager.requestAudioFocus(mOnAudioFocusChangeListener,
+                AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
+        if (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            mHasAudioFocus = true;
+        } else {
+            pause();
+        }
+    }
+
+    private void abandonAudioFocus() {
+        mHasAudioFocus = false;
+        mAudioManager.abandonAudioFocus(mOnAudioFocusChangeListener);
+    }
+
+    void updatePlaybackRow() {
         mRowsAdapter.notifyArrayItemRangeChanged(0, 1);
     }
 
@@ -409,7 +495,7 @@ public class PlaybackOverlayFragment
         }
     }
 
-    private void preparePlayer(boolean playWhenReady) {
+    private void preparePlayer() {
         if (mPlayer == null) {
             mPlayer = new VideoPlayer(getRendererBuilder());
             mPlayer.addListener(this);
@@ -421,7 +507,9 @@ public class PlaybackOverlayFragment
             mPlayer.setRendererBuilder(getRendererBuilder());
             mPlayer.prepare();
         }
-        mPlayer.setPlayWhenReady(playWhenReady);
+        mPlayer.setPlayWhenReady(true);
+
+        requestAudioFocus();
     }
 
     private void releasePlayer() {
@@ -429,6 +517,7 @@ public class PlaybackOverlayFragment
             mPlayer.release();
             mPlayer = null;
         }
+        abandonAudioFocus();
     }
 
     @Override
@@ -554,10 +643,24 @@ public class PlaybackOverlayFragment
     }
 
     private void playVideo(Video video, Bundle extras) {
-        mSelectedVideo = video;
-        preparePlayer(true);
+        updateSelectedVideo(video);
+        preparePlayer();
         setPlaybackState(PlaybackState.STATE_PAUSED);
-        playPause(extras.getBoolean(AUTO_PLAY));
+        if (extras.getBoolean(AUTO_PLAY)) {
+            play();
+        } else {
+            pause();
+        }
+    }
+
+    private void startPlaying() {
+        // Prepare the player and start playing the selected video
+        playVideo(mSelectedVideo, mAutoPlayExtras);
+
+        // Start loading videos for the queue
+        Bundle args = new Bundle();
+        args.putString(VideoContract.VideoEntry.COLUMN_CATEGORY, mSelectedVideo.category);
+        getLoaderManager().initLoader(QUEUE_VIDEOS_LOADER, args, mCallbacks);
     }
 
     private final class ItemViewClickedListener implements OnItemViewClickedListener {
@@ -585,7 +688,7 @@ public class PlaybackOverlayFragment
 
         @Override
         public void onPlay() {
-            playPause(true);
+            play();
         }
 
         @Override
@@ -598,7 +701,7 @@ public class PlaybackOverlayFragment
 
         @Override
         public void onPause() {
-            playPause(false);
+            pause();
         }
 
         @Override
@@ -663,26 +766,6 @@ public class PlaybackOverlayFragment
         @Override
         public void onSeekTo(long position) {
             setPosition(position);
-        }
-    }
-
-    private class MediaControllerCallback extends MediaController.Callback {
-
-        @Override
-        public void onPlaybackStateChanged(@NonNull PlaybackState state) {
-            // Update your UI to reflect the new state. Do not change media playback here.
-            if (DEBUG) Log.d(TAG, "Playback state changed: " + state.getState());
-
-            int nextState = state.getState();
-            if (nextState != PlaybackState.STATE_NONE) {
-                mGlue.updateProgress();
-            }
-        }
-
-        @Override
-        public void onMetadataChanged(MediaMetadata metadata) {
-            mGlue.onMetadataChanged(); // Update metadata on controls.
-            updatePlaybackRow();
         }
     }
 }

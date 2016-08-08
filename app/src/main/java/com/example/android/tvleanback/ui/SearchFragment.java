@@ -71,6 +71,7 @@ public class SearchFragment extends android.support.v17.leanback.app.SearchFragm
             new CursorObjectAdapter(new CardPresenter());
 
     private int mSearchLoaderId = 1;
+    private boolean mResultsFound = false;
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
@@ -112,19 +113,15 @@ public class SearchFragment extends android.support.v17.leanback.app.SearchFragm
                     case Activity.RESULT_OK:
                         setSearchQuery(data, true);
                         break;
-                    case Activity.RESULT_CANCELED:
-                        // Once recognizer canceled, user expects the current activity to process
-                        // the same BACK press as user doesn't know about overlay activity.
-                        // However, you may not want this behaviour as it makes harder to
-                        // fall back to keyboard input.
+                    default:
+                        // If recognizer is canceled or failed, keep focus on the search orb
                         if (FINISH_ON_RECOGNIZER_CANCELED) {
                             if (!hasResults()) {
-                                if (DEBUG) Log.v(TAG, "Delegating BACK press from recognizer");
-                                getActivity().onBackPressed();
+                                if (DEBUG) Log.v(TAG, "Voice search canceled");
+                                getView().findViewById(R.id.lb_search_bar_speech_orb).requestFocus();
                             }
                         }
                         break;
-                    // the rest includes various recognizer errors, see {@link RecognizerIntent}
                 }
                 break;
         }
@@ -150,7 +147,7 @@ public class SearchFragment extends android.support.v17.leanback.app.SearchFragm
     }
 
     public boolean hasResults() {
-        return mRowsAdapter.size() > 0;
+        return mRowsAdapter.size() > 0 && mResultsFound;
     }
 
     private boolean hasPermission(final String permission) {
@@ -164,6 +161,10 @@ public class SearchFragment extends android.support.v17.leanback.app.SearchFragm
             mQuery = query;
             getLoaderManager().initLoader(mSearchLoaderId++, null, this);
         }
+    }
+
+    public void focusOnSearch() {
+        getView().findViewById(R.id.lb_search_bar).requestFocus();
     }
 
     @Override
@@ -182,20 +183,19 @@ public class SearchFragment extends android.support.v17.leanback.app.SearchFragm
 
     @Override
     public void onLoadFinished(Loader<Cursor> loader, Cursor cursor) {
+        int titleRes;
         if (cursor != null && cursor.moveToFirst()) {
-            mVideoCursorAdapter.changeCursor(cursor);
-
-            mRowsAdapter.clear();
-            HeaderItem header = new HeaderItem(getString(R.string.search_results, mQuery));
-            ListRow row = new ListRow(header, mVideoCursorAdapter);
-            mRowsAdapter.add(row);
+            mResultsFound = true;
+            titleRes = R.string.search_results;
         } else {
-            // No results were found.
-            mRowsAdapter.clear();
-            HeaderItem header = new HeaderItem(getString(R.string.no_search_results, mQuery));
-            ListRow row = new ListRow(header, new ArrayObjectAdapter());
-            mRowsAdapter.add(row);
+            mResultsFound = false;
+            titleRes = R.string.no_search_results;
         }
+        mVideoCursorAdapter.changeCursor(cursor);
+        HeaderItem header = new HeaderItem(getString(titleRes, mQuery));
+        mRowsAdapter.clear();
+        ListRow row = new ListRow(header, mVideoCursorAdapter);
+        mRowsAdapter.add(row);
     }
 
     @Override
